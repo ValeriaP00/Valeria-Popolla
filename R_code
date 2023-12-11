@@ -1,1 +1,671 @@
+library(BiocGenerics) 
+library(DESeq2)
+library(psych) 
+library(NetworkToolbox)
+library(ggnet)
+library(ggplot2);
+library(GGally);library(sna);library(network)
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(DT)
+library(igraph)
+library(ggraph)
+library(network)
+library(intergraph)
+
+# 1. Download gene expression data
+
+proj <- "TCGA-COAD" #Colon Adenocarcinoma
+dir.create(file.path(proj))
+
+rna.query.C <- GDCquery(project = proj, data.category = "Transcriptome Profiling",
+                        data.type = "Gene Expression Quantification",
+                        workflow.type = "STAR - Counts",
+                        sample.type = "Primary Tumor")
+
+GDCdownload(query = rna.query.C, directory = "GDCdata", method = "api")
+rna.data.C <- GDCprepare(rna.query.C, directory = "GDCdata")
+rna.expr.data.C <- assay(rna.data.C)
+
+genes.info <- BiocGenerics::as.data.frame(rowRanges(rna.data.C))
+
+rna.query.N <- GDCquery(project = proj, data.category = "Transcriptome Profiling", 
+                        data.type = "Gene Expression Quantification", 
+                        workflow.type = "STAR - Counts", 
+                        sample.type = "Solid Tissue Normal")
+
+GDCdownload(query = rna.query.N, directory = "GDCdata", method = "api")
+rna.data.N <- GDCprepare(rna.query.N, directory = "GDCdata"  )
+rna.expr.data.N <- assay(rna.data.N)
+genes.info2 <- BiocGenerics::as.data.frame(rowRanges(rna.data.N))
+all(na.omit(genes.info2) == na.omit(genes.info))
+
+clinical.query<- GDCquery_clinic(project = proj, type = "clinical", save.csv = FALSE)
+
+dim(rna.expr.data.C)
+dim(rna.expr.data.N)
+length(unique(clinical.query$submitter_id))
+
+
+ ----------------------------------------
+#and select only patients for whom cancer and normal tissue files are available.
+ncol(rna.expr.data.C)
+head(colnames(rna.expr.data.C))
+head(substr(colnames(rna.expr.data.N), 1,12)) 
+
+dim(rna.expr.data.N)
+
+#Check for duplicates in normal sample
+length(unique(substr(colnames(rna.expr.data.N), 1,12))) #no duplicates 
+
+dim(rna.expr.data.C)
+
+#Check for duplicates in the cancer sample
+length(unique(substr(colnames(rna.expr.data.C), 1,12))) 
+
+#Delete duplicates
+patients.C <- substr(colnames(rna.expr.data.C), 1,12)
+sort(table(patients.C)) 
+unique.patients.C <- names(which(table(patients.C) == 1))
+
+idx.unique.pats <- match(unique.patients.C, substr(colnames(rna.expr.data.C), 1,12) )
+
+expr.C <- as.data.frame(rna.expr.data.C[,idx.unique.pats])
+expr.N <- as.data.frame(rna.expr.data.N)
+
+colnames(expr.C) <- substr(colnames(expr.C), 1,12)
+unique(colnames(expr.C))
+
+colnames(expr.N) <- substr(colnames(expr.N), 1,12)
+unique(colnames(expr.N))
+
+length(intersect(colnames(expr.N), colnames(expr.C))) #38
+
+typeof(expr.C[1,1]) #ok
+any(is.na(expr.C)) #ok
+any(is.nan(as.matrix(expr.C))) #ok
+
+typeof(expr.N[1,1]) #ok
+any(is.na(expr.N)) #ok
+any(is.nan(as.matrix(expr.N))) #ok
+
+intersection <- intersect(colnames(expr.N), colnames(expr.C))
+intersection
+
+#let's consider only patients for which we have both normal and cancer samples
+expr.C <- expr.C[, intersection]
+dim(expr.C)
+expr.N <- expr.N[, intersection]
+dim(expr.N)
+
+all(rownames(expr.C) == rownames(expr.N))
+full.data <- cbind(expr.N, expr.C)
+
+dim(full.data)
+full.data <- data.frame(full.data)
+
+metad <- rep("cancer", 76)
+metad[1:38] <- "normal"
+metad
+metad <- data.frame(metad)
+rownames(metad) <- colnames(full.data)
+colnames(metad)[1] <- "condition"
+metad[,1] <- as.factor(metad[,1])
+full.data <- cbind(rownames(full.data), full.data)
+
+dds <- DESeqDataSetFromMatrix(countData=full.data, 
+                              colData=metad, 
+                              design= ~condition,
+                              tidy=TRUE)
+
+dim(counts(dds)) #60660 76 col
+
+# filtering patients: at least ten counts on 100% of patients
+patient_keep = (ncol(dds))
+keep <- rowSums(counts(dds) >= 10) >= patient_keep
+dds <- dds[keep,]
+dim(counts(dds))
+
+dds <- estimateSizeFactors(dds)
+normalized_counts <- counts(dds, normalized=TRUE)
+sum(rowSums(normalized_counts == 0) == 76) #no null rows
+
+filtr.expr.n <- as.data.frame(normalized_counts[, 1:38])
+filtr.expr.c <- as.data.frame(normalized_counts[, 39:76])
+
+#cancerous sample names were added a ".1" in full.data because  
+#they had the same names as the normal samples
+colnames(filtr.expr.c) <- substr(colnames(filtr.expr.c), 1,12)
+
+
+####################################################################################################
+#2: Differentially expressed genes (DEGs) ----- 
+
+#fold-change (fc)
+fc <-  log2(rowMeans(filtr.expr.c) / rowMeans(filtr.expr.n)) #per ogni gene calcolo l'fc score 
+names(fc) <- rownames(filtr.expr.c)
+head(fc)
+
+#p-value
+pval.fc <- sapply(1:nrow(filtr.expr.c), function(i) (t.test(filtr.expr.c[i,], filtr.expr.n[i,] ))$p.value)
+
+pval.fc.fdr <- p.adjust(pval.fc, method="fdr")
+
+#Visualize values as numbers instead of powers
+options(scipen = 9999)
+
+#Dataframe with genes as rows and 2 columns: fc and p-values
+expr.table <- data.frame(cbind(fc, pvalue = pval.fc.fdr))
+expr.table[,1] <- round(expr.table[,1],2)
+expr.table[,2] <- round(expr.table[,2],15)
+
+#Select genes with |FC|>=1.6 & pvalue>=0.05 to find DEGs
+deg.genes <- rownames(expr.table[abs(expr.table$fc) >= 1.6& expr.table$pvalue <= 0.05,]) 
+
+#Dataframe of DEGs
+deg.genes = data.frame(deg.genes)
+
+dim(deg.genes)
+
+#Select under and over-expressed genes
+expr.table$diffexpressed <- "NO";
+expr.table$diffexpressed[expr.table$fc >= 1.6 & expr.table$pvalue <= 0.05] <- "UP"
+expr.table$diffexpressed[expr.table$fc <= -1.6 & expr.table$pvalue <= 0.05] <- "DOWN"
+head(expr.table)
+
+expr.table$diffexpressed <- as.factor(expr.table$diffexpressed)
+summary(expr.table$diffexpressed)
+
+#Volcano plot
+ggplot(data=expr.table, aes(x=fc, y=-log10(pvalue), col=diffexpressed))+  
+  geom_point() +
+  xlab("fold change (log2)") + 
+  ylab("-log10 adjusted p-value") +
+  geom_hline(yintercept=-log10(0.05), col="red")+
+  geom_vline(xintercept=1.6, col="red")+
+  geom_vline(xintercept=-1.6, col="red")
+
+###################################################################################################
+# 3 Co-expression networks----------------------------------
+
+deg.expr.c = filtr.expr.c[deg.genes$deg.genes,]
+deg.expr.n = filtr.expr.n[deg.genes$deg.genes,]
+
+#Log-transformation of DEGs values
+deg.expr.c = log2(deg.expr.c+1)
+deg.expr.n = log2(deg.expr.n+1)
+
+#cor.mat is the correlation matrix 
+cor.mat.c <- corr.test(t(deg.expr.c), use = "pairwise", 
+                       method = "pearson",adjust="fdr",ci=FALSE)
+cor.mat.n <- corr.test(t(deg.expr.n), use = "pairwise", 
+                       method = "pearson",adjust="fdr",ci=FALSE)
+
+rho.c <- cor.mat.c$r
+rho.n <- cor.mat.n$r
+
+diag(rho.c) <- 0 #diagonal = 0
+diag(rho.n) <- 0
+
+#Save in qval.c the p-value matrix of tumoral genes couples
+qval.c <- cor.mat.c$p
+#Save in qval.n the p-value matrix of normal genes couples
+qval.n <- cor.mat.n$p
+
+#qvals are reported on the upper triangle only 
+qval.c[lower.tri(qval.c)] <- t(qval.c)[lower.tri(qval.c)]
+qval.n[lower.tri(qval.n)] <- t(qval.n)[lower.tri(qval.n)]
+
+#Create the adjucency matrix of the tumoral genes taking into account only the correlations between genes which have the p-value <= 0.01. So in the graph, if two genes have p-value greater than 0.01 there won't be a connection between them. 
+
+adj.mat.c = rho.c * (qval.c <= 0.01)
+adj.mat.n = rho.n * (qval.n <= 0.001)
+
+# Cancer network ----------------------------------------------------------
+net.c <- network(adj.mat.c, matrix.type="adjacency",ignore.eval = FALSE, names.eval = "weights", directed=FALSE)
+
+network.density(net.c) 
+network.size(net.c) 
+network.edgecount(net.c)
+
+clustcoeff(adj.mat.c, weighted = FALSE)$CC
+sum(adj.mat.c != 0) 
+#positive and negative correlation
+sum(adj.mat.c > 0) 
+sum(adj.mat.c < 0) 
+
+#DEGREE INDEX
+degree.c <- rowSums(adj.mat.c != 0) # degree for each node
+names(degree.c) <- rownames(adj.mat.c)
+degree.c <- sort(degree.c, decreasing = T) #decreasing order
+head(degree.c,10)
+sum(degree.c == 0) 
+
+hist(main = "Degree distribution of Cancer Network", degree.c, breaks = 30, col = 'mediumturquoise')
+# 5% of nodes with higest degree 
+x <- quantile(degree.c[degree.c>0],0.95) #how big is the degree of the most connected nodes?
+x # 95%   
+abline(v=x, col="navy", lwd = 2, lty = 2)
+#HUBS of the network
+hubs.c <- degree.c[degree.c>=x]
+names(hubs.c) 
+
+#names of some of the hubs
+genes <- read.csv2("/Users/valer/Desktop/Uni/DE/Proj/targets.csv", row.names = 1)
+genes <- genes[,1]
+hubs.c.names <- intersect(names(hubs.c), genes.info[ genes.info$gene_name %in% genes , "gene_id"]) 
+
+hubs.cancer<- genes.info[hubs.c.names, "gene_name"]
+
+
+net.c %v% "type" = ifelse(network.vertex.names(net.c) %in% names(hubs.c),"hub", "non-hub")
+net.c %v% "color" = ifelse(net.c %v% "type" == "hub", "gold", "navy")
+net.c %e% "edge_color" = ifelse(net.c %e% "weights" > 0, "gold", "navy")
+
+ggnet2(net.c, color = "color", alpha = 0.8, size = 2, 
+       #edge.color = "edgecolor", 
+       edge.alpha = 1, edge.size = 0.15)+
+  guides(size = "none") 
+
+
+# Normal network ----------------------------------------------------------
+net.n <- network(adj.mat.n, matrix.type="adjacency",ignore.eval = FALSE, names.eval = "weights", directed =F)
+
+network.density(net.n) 
+network.size(net.n) 
+network.edgecount(net.n) 
+clustcoeff(adj.mat.n, weighted = FALSE)$CC 
+#nrow(component.largest(net.n, result = "graph")) 
+
+sum(adj.mat.n != 0) 
+#how many positive/negative correlations? 
+sum(adj.mat.n > 0)
+sum(adj.mat.n < 0) 
+
+#DEGREE INDEX
+degree.n <- rowSums(adj.mat.n != 0) 
+names(degree.n) <- rownames(adj.mat.n)
+degree.n <- sort(degree.n, decreasing = T) 
+head(degree.n,10)
+sum(degree.n == 0) 
+hist(main = "Degree distribution of Normal Network",degree.n, breaks = 30, col = 'mediumturquoise')
+y <- quantile(degree.n[degree.n>0],0.95) #how big is the degree of the most connected nodes?
+y #95% 
+abline(v=y, col="navy", lwd = 2, lty = 2)
+
+#HUBS of the network
+hubs.n <- degree.n[degree.n>=y]
+names(hubs.n) 
+
+#Hubs names 
+hubs.n.names <- intersect(names(hubs.n), genes.info2[genes.info2$gene_name %in% genes , "gene_id"])  
+hubs.normal<- genes.info2[hubs.n.names, "gene_name"]
+
+
+net.n %v% "type" = ifelse(network.vertex.names(net.n) %in% names(hubs.n),"hub", "non-hub")
+net.n %v% "color" = ifelse(net.n %v% "type" == "hub", "gold", "navy")
+net.n %e% "edge_color" = ifelse(net.n %e% "weights" > 0, "gold", "navy")
+
+ggnet2(net.n, color = "color", alpha = 0.8, size = 2,  #mode= c("x","y"),
+       #edge.color = "edgecolor", 
+       edge.alpha = 1, edge.size = 0.15)+
+  guides(size = "none") 
+
+nodes_in_common = intersect(names(hubs.c), names(hubs.n))
+nodes_in_common 
+intersect(hubs.cancer, hubs.normal) #same as above 
+
+
+##################################################################################################
+# 4 Differential Co-expressed Network-Computation ----------------------
+
+corr_z_n = 1/2*(log((1+rho.n)/(1-rho.n)))
+corr_z_c = 1/2*(log((1+rho.c)/(1-rho.c)))
+n1 = n2 = ncol(deg.expr.c)
+den = sqrt(1/(n1-3)) + sqrt(1/(n2-3))
+Z = (corr_z_n - corr_z_c)/den
+Z = Z * (abs(Z) > 3)
+
+# 4.2. Differential Co-expressed Network-Analysis -------------------------
+
+degree.z <- rowSums(Z != 0)
+names(degree.z) <- rownames(Z)
+degree.z <- sort(degree.z, decreasing = T)
+head(degree.z,10)
+sum(degree.z == 0) 
+
+hist(main = "Degree distribution of Differential Co-Expression Network", degree.z, breaks = 30, col = 'mediumturquoise') # SCALE-FREE
+
+x_z <- quantile(degree.z[degree.z>0],0.95)#how big is the degree of the most connected nodes?
+
+hubs.z <- degree.z[degree.z>=x_z]
+
+# comparing the  hubs identified now and in the network with n and c.
+intersect(names(hubs.z),names(hubs.n))
+intersect(names(hubs.z),names(hubs.c))
+
+#Subnetwork plot of the most relevant genes
+
+g <- graph_from_adjacency_matrix(as.matrix(Z), mode = "undirected")
+hubs_subset <- induced_subgraph(graph = g, vids = which(V(g)$name %in% names(hubs.z)))
+hubs_subset <- delete.vertices(hubs_subset, which(degree(hubs_subset) == 0))
+V(hubs_subset)$label <- V(hubs_subset)$name
+#?layout
+layout <- layout_in_circle(hubs_subset)
+plot(hubs_subset, layout = layout, main = "Subnetwork plot of the most relevant genes in differential co-expression network", edge.color = NA, vertex.label.cex = 0.8)
+
+##################################################################################################
+# 5. Patient similarity (PSN) ---------------------------------------------
+
+psn_matrix_c <- cor(filtr.expr.c, method = "pearson")
+diag(psn_matrix_c) <- 0
+psn_graph_c <- graph.adjacency(psn_matrix_c, mode = "undirected", weighted = TRUE)
+vcount(psn_graph_c)
+ecount(psn_graph_c)
+edge_density(psn_graph_c)
+
+# Community detection
+louvain_communities_c <- cluster_louvain(psn_graph_c)
+community_membership_c <- membership(louvain_communities_c)
+edge_colors <- custom_palette[community_membership_c]
+layout <- layout_with_fr(psn_graph_c)
+for (i in unique(community_membership_c)) {
+  community_nodes <- which(community_membership_c == i)
+  layout[community_nodes, ] <- layout[community_nodes, ] + i * 2  
+}
+plot(psn_graph_c, 
+     vertex.color = custom_palette[community_membership_c], 
+     vertex.label.cex = 0.6,  
+     vertex.label.dist = 0.5,   
+     edge.color = edge_colors,  # Use the custom edge color palette
+     main = "Community Detection with Louvain Algorithm",
+     layout = layout)
+
+####################################################################################################
+# Optional tasks  ---------------------------------------------------------
+# 6.1. Compute a different centrality index (CI) and check the ove --------
+#Betweenness
+adj.mat.c = rho.c * (qval.c <= 0.01)
+adj.mat.n = rho.n * (qval.n <= 0.001)
+
+#Hubs betweenness cancer
+adj.mat.c[adj.mat.c < 0] <- 0
+graph.c <- graph.adjacency(adj.mat.c, mode = "undirected", weighted = TRUE)
+betweenness.c <- betweenness(graph.c)
+head(betweenness.c, 10)
+
+# Number of nodes with betweenness centrality equal to 0
+sum(betweenness.c == 0)
+
+# Histogram of betweenness centrality
+hist(main = "Betweenness centrality distribution for Cancer network",betweenness.c, breaks = 20, col = 'mediumturquoise')
+
+# 5% of nodes with highest betweenness centrality
+y <- quantile(betweenness.c[betweenness.c > 0], 0.95)
+
+# Plot a vertical line at the 95th percentile
+abline(v = y, col = "navy", lwd = 2, lty = 2)
+
+# Hubs based on betweenness centrality
+hubs.betweenness.c <- names(betweenness.c[betweenness.c >= y])
+hubs.betweenness.c
+
+#Hubs betweenness normal
+adj.mat.n[adj.mat.n < 0] <- 0
+graph.n <- graph.adjacency(adj.mat.n, mode = "undirected", weighted = TRUE)
+betweenness.n <- betweenness(graph.n)
+head(betweenness.n, 10)
+
+# Number of nodes with betweenness centrality equal to 0
+sum(betweenness.n == 0)
+
+# Histogram of betweenness centrality
+hist(main = "Betweenness centrality distribution for Normal network",betweenness.n, breaks = 20, col = 'mediumturquoise')
+
+# 5% of nodes with highest betweenness centrality
+y <- quantile(betweenness.n[betweenness.n > 0], 0.95)
+
+# Plot a vertical line at the 95th percentile
+abline(v = y, col = "navy", lwd = 2, lty = 2)
+
+# Hubs based on betweenness centrality
+hubs.betweenness.n <- names(betweenness.n[betweenness.n >= y])
+hubs.betweenness.n
+
+#Check overlap 
+intersect(names(hubs.c), hubs.betweenness.c)
+intersect(names(hubs.n), hubs.betweenness.n)
+
+
+# 6.2. Perform the study using a different similarity measure -------------
+#Spearman
+
+cor.mat.c <- corr.test(t(deg.expr.c), use = "pairwise", 
+                       method = "spearman",adjust="fdr",ci=FALSE)
+cor.mat.n <- corr.test(t(deg.expr.n), use = "pairwise", 
+                       method = "spearman",adjust="fdr",ci=FALSE)
+
+rho.c <- cor.mat.c$r
+rho.n <- cor.mat.n$r
+diag(rho.c) <- 0 
+diag(rho.n) <- 0
+
+qval.c <- cor.mat.c$p
+
+qval.n <- cor.mat.n$p
+
+qval.c[lower.tri(qval.c)] <- t(qval.c)[lower.tri(qval.c)]
+qval.n[lower.tri(qval.n)] <- t(qval.n)[lower.tri(qval.n)]
+
+adj.mat.c = rho.c * (qval.c <= 0.01)
+
+adj.mat.n = rho.n * (qval.n <= 0.001)
+
+net.c <- network(adj.mat.c, matrix.type="adjacency",ignore.eval = FALSE, names.eval = "weights", directed=FALSE)
+
+network.density(net.c) 
+network.size(net.c) 
+network.edgecount(net.c) 
+
+clustcoeff(adj.mat.c, weighted = FALSE)$CC 
+sum(adj.mat.c != 0) 
+
+sum(adj.mat.c > 0) 
+sum(adj.mat.c < 0) 
+
+degree.c <- rowSums(adj.mat.c != 0) 
+names(degree.c) <- rownames(adj.mat.c)
+degree.c <- sort(degree.c, decreasing = T) 
+head(degree.c,10)
+sum(degree.c == 0)  
+
+hist(degree.c, breaks = 30, col = 'mediumturquoise')
+
+x <- quantile(degree.c[degree.c>0],0.95) 
+x   
+abline(v=x, col="navy", lwd = 2, lty = 2)
+hubs.c <- degree.c[degree.c>=x]
+names(hubs.c) 
+
+#names of some of the hubs
+hubs.c.names <- intersect(names(hubs.c), genes.info[ genes.info$gene_name %in% genes , "gene_id"]) 
+
+hubs.cancer.sp<- genes.info[hubs.c.names, "gene_name"]
+
+net.c %v% "type" = ifelse(network.vertex.names(net.c) %in% names(hubs.c),"hub", "non-hub")
+net.c %v% "color" = ifelse(net.c %v% "type" == "hub", "gold", "navy")
+net.c %e% "edge_color" = ifelse(net.c %e% "weights" > 0, "gold", "navy")
+
+ggnet2(net.c, color = "color", alpha = 0.8, size = 2,  #mode= c("x","y"),
+       #edge.color = "edgecolor", 
+       edge.alpha = 1, edge.size = 0.15)+
+  guides(size = "none") 
+
+
+#Normal network 
+net.n <- network(adj.mat.n, matrix.type="adjacency",ignore.eval = FALSE, names.eval = "weights", directed =F)
+
+network.density(net.n) 
+network.size(net.n) 
+network.edgecount(net.n) 
+clustcoeff(adj.mat.n, weighted = FALSE)$CC 
+
+sum(adj.mat.n != 0)
+
+sum(adj.mat.n > 0) 
+sum(adj.mat.n < 0) 
+
+degree.n <- rowSums(adj.mat.n != 0) 
+names(degree.n) <- rownames(adj.mat.n)
+degree.n <- sort(degree.n, decreasing = T) 
+head(degree.n,10)
+sum(degree.n == 0) 
+hist(degree.n, breaks = 30, col = 'mediumturquoise')
+y <- quantile(degree.n[degree.n>0],0.95)  
+y 
+abline(v=x, col="navy", lwd = 2, lty =2)
+
+hubs.n <- degree.n[degree.n>=y]
+names(hubs.n) 
+
+#names of some of the hubs
+hubs.n.names <- intersect(names(hubs.n), genes.info2[ genes.info2$gene_name %in% genes , "gene_id"]) 
+
+hubs.normal.sp<- genes.info2[hubs.n.names, "gene_name"]
+
+intersect(hubs.cancer.sp, hubs.normal.sp)
+intersect(hubs.cancer.sp, hubs.cancer)
+intersect(hubs.normal.sp, hubs.normal)
+
+net.n %v% "type" = ifelse(network.vertex.names(net.n) %in% names(hubs.n),"hub", "non-hub")
+net.n %v% "color" = ifelse(net.n %v% "type" == "hub", "gold", "navy")
+net.n %e% "edge_color" = ifelse(net.n %e% "weights" > 0, "gold", "navy")
+
+ggnet2(net.n, color = "color", alpha = 0.7, size = 2,  #mode= c("x","y"),
+       #edge.color = "edgecolor", 
+       edge.alpha = 1, edge.size = 0.15)+
+  guides(size = "none") 
+
+nodes_in_common = intersect(names(hubs.c), names(hubs.n))
+nodes_in_common 
+
+corr_z_n = 1/2*(log((1+rho.n)/(1-rho.n)))
+corr_z_c = 1/2*(log((1+rho.c)/(1-rho.c)))
+n1 = n2 = ncol(deg.expr.c)
+den = sqrt(1/(n1-3)) + sqrt(1/(n2-3))
+Z = (corr_z_n - corr_z_c)/den
+Z = Z * (abs(Z) > 3)
+
+degree.z <- rowSums(Z != 0)
+names(degree.z) <- rownames(Z)
+degree.z <- sort(degree.z, decreasing = T)
+head(degree.z,10)
+sum(degree.z == 0) 
+
+hist(degree.z, breaks = 20, col = 'mediumturquoise') 
+
+x_z <- quantile(degree.z[degree.z>0],0.95)
+hubs.z <- degree.z[degree.z>=x_z]
+
+intersect(names(hubs.z),names(hubs.n))
+intersect(names(hubs.z),names(hubs.c))
+
+#Subnetwork plot of the most relevant genes
+
+g <- graph_from_adjacency_matrix(as.matrix(Z), mode = "undirected")
+hubs_subset <- induced_subgraph(graph = g, vids = which(V(g)$name %in% names(hubs.z)))
+hubs_subset <- delete.vertices(hubs_subset, which(degree(hubs_subset) == 0))
+V(hubs_subset)$label <- V(hubs_subset)$name
+#?layout
+layout <- layout_in_circle(hubs_subset)
+plot(hubs_subset, layout = layout, main = "Subnetwork plot of the most relevant genes in differential co-expression network", edge.color = NA, vertex.label.cex = 0.8)
+
+
+psn_matrix_c <- cor(filtr.expr.c, method = "spearman")
+diag(psn_matrix_c) <- 0
+psn_graph_c <- graph.adjacency(psn_matrix_c, mode = "undirected", weighted = TRUE)
+vcount(psn_graph_c)
+ecount(psn_graph_c)
+edge_density(psn_graph_c)
+
+# Community detection
+louvain_communities_c <- cluster_louvain(psn_graph_c)
+community_membership_c <- membership(louvain_communities_c)
+edge_colors <- custom_palette[community_membership_c]
+layout <- layout_with_fr(psn_graph_c)
+for (i in unique(community_membership_c)) {
+  community_nodes <- which(community_membership_c == i)
+  layout[community_nodes, ] <- layout[community_nodes, ] + i * 2  
+}
+plot(psn_graph_c, 
+     vertex.color = custom_palette[community_membership_c], 
+     vertex.label.cex = 0.6,  
+     vertex.label.dist = 0.5,   
+     edge.color = edge_colors,  # Use the custom edge color palette
+     main = "Community Detection with Louvain Algorithm",
+     layout = layout)
+
+
+# 6.3. Perform gene set enrichment analysis -------------------------------
+
+library(enrichR)
+
+genes_of_interest <- hubs.cancer
+websiteLive <- getOption("enrichR.live")
+
+if (websiteLive) {
+  listEnrichrSites()
+  setEnrichrSite("Enrichr")  # Human genes
+}
+
+if (websiteLive) dbs <- listEnrichrDbs()
+if (websiteLive) head(dbs)
+if (websiteLive) dbs$libraryName
+
+dbs <- c("GO_Biological_Process_2023", "KEGG_2021_Human")
+if (websiteLive) {
+  enriched <- enrichr(genes_of_interest, dbs)
+}
+
+if (websiteLive) {
+  go_enrichment_df <- enriched[["GO_Biological_Process_2023"]]
+  kegg_enrichment_df <- enriched[["KEGG_2021_Human"]]
+  
+  View(go_enrichment_df)  # View the GO enrichment data
+  
+  # Plotting the results for GO
+  plotEnrich(go_enrichment_df, showTerms = 20, numChar = 40, y = "Count", orderBy = "P.value")
+  
+  # Plotting the results for KEGG
+  plotEnrich(kegg_enrichment_df, showTerms = 20, numChar = 40, y = "Count", orderBy = "P.value")
+}
+
+
+# 6.4. Perform task 5 using gene expression profiles related to normal condition and compare the community structures of the 2 conditions --------
+
+psn_matrix_n <- cor(filtr.expr.n, method = "pearson")
+diag(psn_matrix_n) <- 0
+psn_graph_n <- graph.adjacency(psn_matrix_n, mode = "undirected", weighted = TRUE)
+
+vcount(psn_graph_n)
+ecount(psn_graph_n)
+edge_density(psn_graph_n)
+
+#Community detection
+louvain_communities_n <- cluster_louvain(psn_graph_n)
+community_membership_n <- membership(louvain_communities_n)
+
+edge_colors <- custom_palette[community_membership_n]
+layout <- layout_with_fr(psn_graph_n)
+for (i in unique(community_membership_n)) {
+  community_nodes <- which(community_membership_n == i)
+  layout[community_nodes, ] <- layout[community_nodes, ] + i * 2  
+}
+plot(psn_graph_n, 
+     vertex.color = custom_palette[community_membership_n], 
+     vertex.label.cex = 0.6,  
+     vertex.label.dist = 0.5,   
+     edge.color = edge_colors,  # Use the custom edge color palette
+     main = "Community Detection with Louvain Algorithm",
+     layout = layout)
 
